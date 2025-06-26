@@ -5,15 +5,24 @@ end
 
 local Players, TweenService, UserInputService = game:GetService("Players"), game:GetService("TweenService"), game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 
 local enabled, showArgs, maxLogs, paused, autoSave, showTimestamps, filterEnabled, currentFilter, highlightNew, monitoring = true, true, 500, false, false, true, false, "", true, true
-local log = loadstring(game:HttpGet("https://gist.githubusercontent.com/ProphecySkondo/55d0332827156d0798fd0b533aa1f188/raw/afd3800978e1799e2feacec9813ff809015825ff/gistfile1.txt"))()
-local gui, mainFrame, logFrame, settingsFrame, miniExecutor, httpLogFrame, decompilerFrame, decompilerContainer, scriptViewer
+
+local gui, mainFrame, logFrame, settingsFrame, miniExecutor, httpLogFrame, decompilerFrame, decompilerContainer, scriptViewer, gameFrame
 local logs, filteredLogs, searchResults, httpLogs, decompilerLogs = {}, {}, {}, {}, {}
 local scriptViewerVisible = false
 local selectedRemote = nil
 local miniExecutorVisible = false
 local currentTab = "RemoteSpy"
+
+local gameActive, gameScore, gameHighScore, gameRunning = false, 0, 0, false
+local snakeBody, snakeDirection, food, gameGrid = {}, "Right", nil, {}
+local gridSize, cellSize = 25, 12
+local gameSpeed = 0.2
+local inputConnection = nil
+local nextDirection = "Right"
+local gameLoopConnection = nil
 
 local stats = {
     totalFires = 0,
@@ -29,6 +38,12 @@ local remoteHistory, blacklistedRemotes, favoriteRemotes, exportData, notificati
 local remoteGroups = {}
 local expandedGroups = {}
 local buttonInteraction = false
+
+local antiCheatEnabled, disableLocalKicks, disableKickRemotes, disableAntiCheatScripts, disableLocalTeleports = false, false, false, false, false
+local originalKick, originalRemoteFunctions, hookedScripts = nil, {}, {}
+local kickHookActive, remoteHookActive, scriptHookActive, teleportHookActive = false, false, false, false
+local oldKickFunction, oldKickIndexHook, oldKickNamecallHook = nil, nil, nil
+local oldTeleportIndexHook, oldTeleportNamecallHook = nil, nil
 
 makeButtonNonDraggable = function(button)
     button.InputBegan:Connect(function(input)
@@ -160,11 +175,697 @@ parseArguments = function(argsString)
     return args
 end
 
+setupLocalKickHook = function()
+    if kickHookActive or not disableLocalKicks then return end
+    if not hookmetamethod then return end
+    
+    local LocalPlayer = Players.LocalPlayer
+    
+    if hookfunction then
+        oldKickFunction = hookfunction(LocalPlayer.Kick, function() end)
+    end
+    
+    oldKickIndexHook = hookmetamethod(game, "__index", function(self, method)
+        if self == LocalPlayer and method:lower() == "kick" then
+            return error("Expected ':' not '.' calling member function Kick", 2)
+        end
+        return oldKickIndexHook(self, method)
+    end)
+    
+    oldKickNamecallHook = hookmetamethod(game, "__namecall", function(self, ...)
+        if self == LocalPlayer and getnamecallmethod():lower() == "kick" then
+            return
+        end
+        return oldKickNamecallHook(self, ...)
+    end)
+    
+    kickHookActive = true
+end
+
+setupRemoteKickHook = function()
+    if remoteHookActive or not disableKickRemotes then return end
+    
+    local mt = getrawmetatable(game)
+    local oldNamecall = mt.__namecall
+    
+    setreadonly(mt, false)
+    mt.__namecall = function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+        
+        if method == "FireServer" or method == "InvokeServer" then
+            local remoteName = tostring(self)
+            if remoteName:lower():find("kick") or remoteName:lower():find("ban") or remoteName:lower():find("anticheat") then
+                return
+            end
+        end
+        
+        return oldNamecall(self, ...)
+    end
+    setreadonly(mt, true)
+    remoteHookActive = true
+end
+
+setupAntiCheatScriptHook = function()
+    if scriptHookActive or not disableAntiCheatScripts then return end
+    
+    local function hookScript(script)
+        if script and script:IsA("LocalScript") then
+            local source = ""
+            if getsource then
+                local success, result = pcall(getsource, script)
+                if success then source = result:lower() end
+            elseif decompile then
+                local success, result = pcall(decompile, script)
+                if success then source = result:lower() end
+            end
+            
+            if source:find("kick") or source:find("ban") or source:find("anticheat") or source:find("anti%-cheat") then
+                script.Disabled = true
+                hookedScripts[script] = true
+            end
+        end
+    end
+    
+    for _, script in pairs(game:GetDescendants()) do
+        hookScript(script)
+    end
+    
+    game.DescendantAdded:Connect(hookScript)
+    scriptHookActive = true
+end
+
+disableLocalKickHook = function()
+    if not kickHookActive then return end
+    
+    if oldKickFunction then
+        oldKickFunction = nil
+    end
+    
+    if oldKickIndexHook then
+        oldKickIndexHook = nil
+    end
+    
+    if oldKickNamecallHook then
+        oldKickNamecallHook = nil
+    end
+    
+    kickHookActive = false
+end
+
+disableRemoteKickHook = function()
+    if not remoteHookActive then return end
+    
+    local mt = getrawmetatable(game)
+    if mt.__namecall ~= getnamecallmethod then
+        setreadonly(mt, false)
+        mt.__namecall = getnamecallmethod
+        setreadonly(mt, true)
+        remoteHookActive = false
+    end
+end
+
+disableAntiCheatScriptHook = function()
+    if not scriptHookActive then return end
+    
+    for script, _ in pairs(hookedScripts) do
+        if script and script.Parent then
+            script.Disabled = false
+        end
+    end
+    
+    hookedScripts = {}
+    scriptHookActive = false
+end
+
+toggleLocalKicks = function(state)
+    disableLocalKicks = state
+    if state then
+        setupLocalKickHook()
+    else
+        disableLocalKickHook()
+    end
+end
+
+toggleKickRemotes = function(state)
+    disableKickRemotes = state
+    if state then
+        setupRemoteKickHook()
+    else
+        disableRemoteKickHook()
+    end
+end
+
+toggleAntiCheatScripts = function(state)
+    disableAntiCheatScripts = state
+    if state then
+        setupAntiCheatScriptHook()
+    else
+        disableAntiCheatScriptHook()
+    end
+end
+
+setupLocalTeleportHook = function()
+    if teleportHookActive or not disableLocalTeleports then return end
+    if not hookmetamethod then return end
+    
+    local TeleportService = game:GetService("TeleportService")
+    
+    oldTeleportIndexHook = hookmetamethod(game, "__index", function(self, method)
+        if self == TeleportService then
+            if method:lower() == "teleport" then
+                return error("Expected ':' not '.' calling member function Teleport", 2)
+            elseif method == "TeleportToPlaceInstance" then
+                return error("Expected ':' not '.' calling member function TeleportToPlaceInstance", 2)
+            end
+        end
+        return oldTeleportIndexHook(self, method)
+    end)
+    
+    oldTeleportNamecallHook = hookmetamethod(game, "__namecall", function(self, ...)
+        if self == TeleportService and (getnamecallmethod():lower() == "teleport" or getnamecallmethod() == "TeleportToPlaceInstance") then
+            return
+        end
+        return oldTeleportNamecallHook(self, ...)
+    end)
+    
+    teleportHookActive = true
+end
+
+disableLocalTeleportHook = function()
+    if not teleportHookActive then return end
+    
+    if oldTeleportIndexHook then
+        oldTeleportIndexHook = nil
+    end
+    
+    if oldTeleportNamecallHook then
+        oldTeleportNamecallHook = nil
+    end
+    
+    teleportHookActive = false
+end
+
+toggleLocalTeleports = function(state)
+    disableLocalTeleports = state
+    if state then
+        setupLocalTeleportHook()
+    else
+        disableLocalTeleportHook()
+    end
+end
+
+createGameFrame = function()
+    if gameFrame then
+        if inputConnection then
+            inputConnection:Disconnect()
+            inputConnection = nil
+        end
+        gameFrame:Destroy()
+    end
+    
+    gameFrame = Instance.new("Frame")
+    gameFrame.Name = "GameFrame"
+    gameFrame.Size = UDim2.new(1, -10, 1, -90)
+    gameFrame.Position = UDim2.new(0, 5, 0, 85)
+    gameFrame.BackgroundColor3 = Color3.new(0.2, 0.2, 0.2)
+    gameFrame.BorderColor3 = Color3.new(0.4, 0.4, 0.4)
+    gameFrame.BorderSizePixel = 2
+    gameFrame.Visible = false
+    gameFrame.Parent = mainFrame
+    gameFrame.ClipsDescendants = true
+    
+    local gameTitle = Instance.new("TextLabel")
+    gameTitle.Size = UDim2.new(1, 0, 0, 40)
+    gameTitle.Position = UDim2.new(0, 0, 0, 0)
+    gameTitle.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+    gameTitle.BorderColor3 = Color3.new(0.4, 0.4, 0.4)
+    gameTitle.BorderSizePixel = 1
+    gameTitle.Text = "SNAKE GAME - ARROW KEYS TO MOVE | WALLS WRAP AROUND!"
+    gameTitle.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+    gameTitle.TextSize = 14
+    gameTitle.Font = Enum.Font.SourceSansBold
+    gameTitle.Parent = gameFrame
+    
+    local gameArea = Instance.new("Frame")
+    gameArea.Name = "GameArea"
+    gameArea.Size = UDim2.new(1, -20, 1, -100)
+    gameArea.Position = UDim2.new(0, 10, 0, 45)
+    gameArea.BackgroundColor3 = Color3.new(0.1, 0.1, 0.1)
+    gameArea.BorderColor3 = Color3.new(0.3, 0.3, 0.3)
+    gameArea.BorderSizePixel = 2
+    gameArea.Parent = gameFrame
+    gameArea.ClipsDescendants = true
+    
+    -- Add subtle grid lines to show wrapping boundaries
+    local topBorder = Instance.new("Frame")
+    topBorder.Name = "TopBorder"
+    topBorder.Size = UDim2.new(1, 0, 0, 1)
+    topBorder.Position = UDim2.new(0, 0, 0, 0)
+    topBorder.BackgroundColor3 = Color3.new(0.2, 0.4, 0.2)
+    topBorder.BorderSizePixel = 0
+    topBorder.Parent = gameArea
+    
+    local bottomBorder = Instance.new("Frame")
+    bottomBorder.Name = "BottomBorder"
+    bottomBorder.Size = UDim2.new(1, 0, 0, 1)
+    bottomBorder.Position = UDim2.new(0, 0, 1, -1)
+    bottomBorder.BackgroundColor3 = Color3.new(0.2, 0.4, 0.2)
+    bottomBorder.BorderSizePixel = 0
+    bottomBorder.Parent = gameArea
+    
+    local leftBorder = Instance.new("Frame")
+    leftBorder.Name = "LeftBorder"
+    leftBorder.Size = UDim2.new(0, 1, 1, 0)
+    leftBorder.Position = UDim2.new(0, 0, 0, 0)
+    leftBorder.BackgroundColor3 = Color3.new(0.2, 0.4, 0.2)
+    leftBorder.BorderSizePixel = 0
+    leftBorder.Parent = gameArea
+    
+    local rightBorder = Instance.new("Frame")
+    rightBorder.Name = "RightBorder"
+    rightBorder.Size = UDim2.new(0, 1, 1, 0)
+    rightBorder.Position = UDim2.new(1, -1, 0, 0)
+    rightBorder.BackgroundColor3 = Color3.new(0.2, 0.4, 0.2)
+    rightBorder.BorderSizePixel = 0
+    rightBorder.Parent = gameArea
+    
+    local scoreLabel = Instance.new("TextLabel")
+    scoreLabel.Name = "ScoreLabel"
+    scoreLabel.Size = UDim2.new(0, 200, 0, 30)
+    scoreLabel.Position = UDim2.new(0, 10, 1, -50)
+    scoreLabel.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+    scoreLabel.BorderColor3 = Color3.new(0.4, 0.4, 0.4)
+    scoreLabel.BorderSizePixel = 1
+    scoreLabel.Text = "SCORE: 0 | HIGH: " .. gameHighScore
+    scoreLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+    scoreLabel.TextSize = 14
+    scoreLabel.Font = Enum.Font.SourceSansBold
+    scoreLabel.TextXAlignment = Enum.TextXAlignment.Center
+    scoreLabel.Parent = gameFrame
+    
+    local startBtn = Instance.new("TextButton")
+    startBtn.Name = "StartBtn"
+    startBtn.Size = UDim2.new(0, 80, 0, 30)
+    startBtn.Position = UDim2.new(1, -90, 1, -50)
+    startBtn.BackgroundColor3 = Color3.new(0.4, 0.6, 0.4)
+    startBtn.BorderColor3 = Color3.new(0.2, 0.2, 0.2)
+    startBtn.BorderSizePixel = 2
+    startBtn.Text = "START"
+    startBtn.TextColor3 = Color3.new(0.1, 0.1, 0.1)
+    startBtn.TextSize = 12
+    startBtn.Font = Enum.Font.SourceSansBold
+    startBtn.Parent = gameFrame
+    
+    startBtn.MouseButton1Click:Connect(function()
+        if not gameRunning then
+            startGame()
+        else
+            resetGame()
+        end
+    end)
+    
+    local ContextActionService = game:GetService("ContextActionService")
+    
+    local function handleInput(actionName, inputState, inputObject)
+        if inputState ~= Enum.UserInputState.Begin or currentTab ~= "Game" or not gameRunning then
+            return Enum.ContextActionResult.Pass
+        end
+        
+        if inputObject.KeyCode == Enum.KeyCode.Up or inputObject.KeyCode == Enum.KeyCode.W then
+            if snakeDirection ~= "Down" and nextDirection ~= "Down" then 
+                nextDirection = "Up" 
+            end
+            return Enum.ContextActionResult.Sink
+        elseif inputObject.KeyCode == Enum.KeyCode.Down or inputObject.KeyCode == Enum.KeyCode.S then
+            if snakeDirection ~= "Up" and nextDirection ~= "Up" then 
+                nextDirection = "Down" 
+            end
+            return Enum.ContextActionResult.Sink
+        elseif inputObject.KeyCode == Enum.KeyCode.Left or inputObject.KeyCode == Enum.KeyCode.A then
+            if snakeDirection ~= "Right" and nextDirection ~= "Right" then 
+                nextDirection = "Left" 
+            end
+            return Enum.ContextActionResult.Sink
+        elseif inputObject.KeyCode == Enum.KeyCode.Right or inputObject.KeyCode == Enum.KeyCode.D then
+            if snakeDirection ~= "Left" and nextDirection ~= "Left" then 
+                nextDirection = "Right" 
+            end
+            return Enum.ContextActionResult.Sink
+        end
+        
+        return Enum.ContextActionResult.Pass
+    end
+    
+    ContextActionService:BindAction("SnakeMovement", handleInput, false, 
+        Enum.KeyCode.Up, Enum.KeyCode.Down, Enum.KeyCode.Left, Enum.KeyCode.Right,
+        Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D)
+    
+    gameFrame.AncestryChanged:Connect(function()
+        if not gameFrame.Parent then
+            ContextActionService:UnbindAction("SnakeMovement")
+        end
+    end)
+end
+
+startGame = function()
+    if not gameFrame then return end
+    
+    gameRunning = true
+    gameScore = 0
+    snakeDirection = "Right"
+    nextDirection = "Right"
+    
+    local centerX = math.floor(gridSize / 2)
+    local centerY = math.floor(gridSize / 2)
+    
+    -- Ensure snake starts away from edges
+    centerX = math.max(4, math.min(gridSize - 3, centerX))
+    centerY = math.max(3, math.min(gridSize - 2, centerY))
+    
+    snakeBody = {
+        {x = centerX, y = centerY},
+        {x = centerX - 1, y = centerY},
+        {x = centerX - 2, y = centerY}
+    }
+    
+    spawnFood()
+    drawGame()
+    updateScore()
+    
+    local startBtn = gameFrame:FindFirstChild("StartBtn")
+    if startBtn then
+        startBtn.Text = "RESET"
+        startBtn.BackgroundColor3 = Color3.new(0.6, 0.3, 0.3)
+    end
+    
+    if gameLoopConnection then
+        gameLoopConnection:Disconnect()
+    end
+    
+    gameLoopConnection = RunService.Heartbeat:Connect(function()
+        updateGame()
+    end)
+end
+
+resetGame = function()
+    if not gameFrame then return end
+    
+    gameRunning = false
+    gameScore = 0
+    snakeBody = {}
+    food = nil
+    snakeDirection = "Right"
+    nextDirection = "Right"
+    
+    if gameLoopConnection then
+        gameLoopConnection:Disconnect()
+        gameLoopConnection = nil
+    end
+    
+    clearGame()
+    
+    local startBtn = gameFrame:FindFirstChild("StartBtn")
+    if startBtn then
+        startBtn.Text = "START"
+        startBtn.BackgroundColor3 = Color3.new(0.4, 0.6, 0.4)
+    end
+    
+    updateScore()
+end
+
+spawnFood = function()
+    if not gameFrame then return end
+    
+    local gameArea = gameFrame:FindFirstChild("GameArea")
+    if not gameArea then return end
+    
+    local availablePositions = {}
+    
+    -- Avoid edges (x=1, x=gridSize, y=1, y=gridSize)
+    for x = 2, gridSize - 1 do
+        for y = 2, gridSize - 1 do
+            if not isSnakePosition(x, y) then
+                table.insert(availablePositions, {x = x, y = y})
+            end
+        end
+    end
+    
+    if #availablePositions > 0 then
+        local randomIndex = math.random(1, #availablePositions)
+        food = availablePositions[randomIndex]
+    else
+        -- If no space in center, allow edges but still avoid snake
+        for x = 1, gridSize do
+            for y = 1, gridSize do
+                if not isSnakePosition(x, y) then
+                    table.insert(availablePositions, {x = x, y = y})
+                end
+            end
+        end
+        
+        if #availablePositions > 0 then
+            local randomIndex = math.random(1, #availablePositions)
+            food = availablePositions[randomIndex]
+        else
+            gameOver()
+        end
+    end
+end
+
+local lastUpdateTime = 0
+
+updateGame = function()
+    if not gameRunning or not gameFrame then return end
+    
+    local currentTime = tick()
+    if currentTime - lastUpdateTime < gameSpeed then
+        return
+    end
+    lastUpdateTime = currentTime
+    
+    snakeDirection = nextDirection
+    
+    if #snakeBody == 0 then return end
+    
+    local head = snakeBody[1]
+    local newHead = {x = head.x, y = head.y}
+    
+    if snakeDirection == "Up" then
+        newHead.y = newHead.y - 1
+    elseif snakeDirection == "Down" then
+        newHead.y = newHead.y + 1
+    elseif snakeDirection == "Left" then
+        newHead.x = newHead.x - 1
+    elseif snakeDirection == "Right" then
+        newHead.x = newHead.x + 1
+    end
+    
+    -- Wall wrapping - teleport to opposite side
+    if newHead.x < 1 then
+        newHead.x = gridSize
+    elseif newHead.x > gridSize then
+        newHead.x = 1
+    end
+    
+    if newHead.y < 1 then
+        newHead.y = gridSize
+    elseif newHead.y > gridSize then
+        newHead.y = 1
+    end
+    
+    if isSnakePosition(newHead.x, newHead.y) then
+        gameOver()
+        return
+    end
+    
+    table.insert(snakeBody, 1, newHead)
+    
+    if food and newHead.x == food.x and newHead.y == food.y then
+        gameScore = gameScore + 1
+        updateScore()
+        spawnFood()
+        
+        if gameScore % 5 == 0 and gameSpeed > 0.1 then
+            gameSpeed = gameSpeed - 0.02
+        end
+    else
+        table.remove(snakeBody, #snakeBody)
+    end
+    
+    drawGame()
+end
+
+isSnakePosition = function(x, y)
+    for _, segment in pairs(snakeBody) do
+        if segment.x == x and segment.y == y then
+            return true
+        end
+    end
+    return false
+end
+
+drawGame = function()
+    if not gameFrame then return end
+    
+    local gameArea = gameFrame:FindFirstChild("GameArea")
+    if not gameArea then return end
+    
+    clearGame()
+    
+    for i, segment in pairs(snakeBody) do
+        local snakeSegment = Instance.new("Frame")
+        snakeSegment.Name = "SnakeSegment"
+        snakeSegment.Size = UDim2.new(0, cellSize - 1, 0, cellSize - 1)
+        snakeSegment.Position = UDim2.new(0, (segment.x - 1) * cellSize + 1, 0, (segment.y - 1) * cellSize + 1)
+        snakeSegment.BorderSizePixel = 0
+        
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 2)
+        corner.Parent = snakeSegment
+        
+        if i == 1 then
+            snakeSegment.BackgroundColor3 = Color3.new(0.1, 0.9, 0.1)
+            
+            local eye1 = Instance.new("Frame")
+            eye1.Size = UDim2.new(0, 2, 0, 2)
+            eye1.Position = UDim2.new(0, 3, 0, 3)
+            eye1.BackgroundColor3 = Color3.new(0, 0, 0)
+            eye1.BorderSizePixel = 0
+            eye1.Parent = snakeSegment
+            
+            local eye2 = Instance.new("Frame")
+            eye2.Size = UDim2.new(0, 2, 0, 2)
+            eye2.Position = UDim2.new(0, 7, 0, 3)
+            eye2.BackgroundColor3 = Color3.new(0, 0, 0)
+            eye2.BorderSizePixel = 0
+            eye2.Parent = snakeSegment
+        else
+            local intensity = math.max(0.3, 1 - (i - 2) * 0.1)
+            snakeSegment.BackgroundColor3 = Color3.new(0.1 * intensity, 0.7 * intensity, 0.1 * intensity)
+        end
+        
+        snakeSegment.Parent = gameArea
+    end
+    
+    if food then
+        local foodFrame = Instance.new("Frame")
+        foodFrame.Name = "Food"
+        foodFrame.Size = UDim2.new(0, cellSize - 1, 0, cellSize - 1)
+        foodFrame.Position = UDim2.new(0, (food.x - 1) * cellSize + 1, 0, (food.y - 1) * cellSize + 1)
+        foodFrame.BackgroundColor3 = Color3.new(0.9, 0.1, 0.1)
+        foodFrame.BorderSizePixel = 0
+        
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 3)
+        corner.Parent = foodFrame
+        
+        local pulse = TweenService:Create(foodFrame, 
+            TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+            {BackgroundColor3 = Color3.new(1, 0.3, 0.3)}
+        )
+        pulse:Play()
+        
+        foodFrame.Parent = gameArea
+    end
+end
+
+clearGame = function()
+    if not gameFrame then return end
+    
+    local gameArea = gameFrame:FindFirstChild("GameArea")
+    if not gameArea then return end
+    
+    for _, child in pairs(gameArea:GetChildren()) do
+        if child.Name == "SnakeSegment" or child.Name == "Food" then
+            child:Destroy()
+        end
+    end
+end
+
+
+
+updateScore = function()
+    if not gameFrame then return end
+    
+    local scoreLabel = gameFrame:FindFirstChild("ScoreLabel")
+    if scoreLabel then
+        scoreLabel.Text = "SCORE: " .. gameScore .. " | HIGH: " .. gameHighScore .. " | LENGTH: " .. #snakeBody
+    end
+end
+
+gameOver = function()
+    gameRunning = false
+    
+    if gameLoopConnection then
+        gameLoopConnection:Disconnect()
+        gameLoopConnection = nil
+    end
+    
+    if gameScore > gameHighScore then
+        gameHighScore = gameScore
+        
+        local scoreLabel = gameFrame:FindFirstChild("ScoreLabel")
+        if scoreLabel then
+            scoreLabel.Text = "NEW HIGH SCORE: " .. gameHighScore .. "!"
+            scoreLabel.TextColor3 = Color3.new(1, 0.8, 0.2)
+            
+            local flash = TweenService:Create(scoreLabel,
+                TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, 3, true),
+                {TextColor3 = Color3.new(1, 1, 0.5)}
+            )
+            flash:Play()
+            
+            flash.Completed:Connect(function()
+                scoreLabel.TextColor3 = Color3.new(0.8, 0.8, 0.8)
+                updateScore()
+            end)
+        end
+    else
+        updateScore()
+    end
+    
+    local startBtn = gameFrame:FindFirstChild("StartBtn")
+    if startBtn then
+        startBtn.Text = "START"
+        startBtn.BackgroundColor3 = Color3.new(0.4, 0.6, 0.4)
+    end
+    
+    local gameArea = gameFrame:FindFirstChild("GameArea")
+    if gameArea then
+        local gameOverLabel = Instance.new("TextLabel")
+        gameOverLabel.Name = "GameOverLabel"
+        gameOverLabel.Size = UDim2.new(1, 0, 0, 40)
+        gameOverLabel.Position = UDim2.new(0, 0, 0.5, -20)
+        gameOverLabel.BackgroundColor3 = Color3.new(0, 0, 0)
+        gameOverLabel.BackgroundTransparency = 0.3
+        gameOverLabel.BorderSizePixel = 0
+        gameOverLabel.Text = "GAME OVER - Score: " .. gameScore
+        gameOverLabel.TextColor3 = Color3.new(1, 0.2, 0.2)
+        gameOverLabel.TextSize = 16
+        gameOverLabel.Font = Enum.Font.SourceSansBold
+        gameOverLabel.TextStrokeTransparency = 0
+        gameOverLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+        gameOverLabel.Parent = gameArea
+        
+        local fadeOut = TweenService:Create(gameOverLabel,
+            TweenInfo.new(3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out),
+            {BackgroundTransparency = 1, TextTransparency = 1}
+        )
+        fadeOut:Play()
+        
+        fadeOut.Completed:Connect(function()
+            gameOverLabel:Destroy()
+        end)
+    end
+end
+
 createScriptViewer = function()
     if scriptViewer then
         scriptViewer:Destroy()
     end
     
+    -- Original simple design
     scriptViewer = Instance.new("Frame")
     scriptViewer.Name = "ScriptViewer"
     scriptViewer.Size = UDim2.new(0, 600, 0, 400)
@@ -176,6 +877,7 @@ createScriptViewer = function()
     scriptViewer.ZIndex = 10
     scriptViewer.Parent = gui
     
+    -- Original title bar
     local viewerTitle = Instance.new("Frame")
     viewerTitle.Name = "ViewerTitle"
     viewerTitle.Size = UDim2.new(1, 0, 0, 25)
@@ -213,6 +915,7 @@ createScriptViewer = function()
     viewerCloseBtn.ZIndex = 12
     viewerCloseBtn.Parent = viewerTitle
     
+    -- Original controls with search added
     local viewerControls = Instance.new("Frame")
     viewerControls.Name = "ViewerControls"
     viewerControls.Size = UDim2.new(1, -10, 0, 30)
@@ -251,10 +954,27 @@ createScriptViewer = function()
     saveScriptBtn.ZIndex = 12
     saveScriptBtn.Parent = viewerControls
     
+    -- Add search box to original design
+    local searchBox = Instance.new("TextBox")
+    searchBox.Name = "SearchBox"
+    searchBox.Size = UDim2.new(0, 120, 1, -4)
+    searchBox.Position = UDim2.new(0, 165, 0, 2)
+    searchBox.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+    searchBox.BorderColor3 = Color3.new(0.3, 0.3, 0.3)
+    searchBox.BorderSizePixel = 1
+    searchBox.PlaceholderText = "Search code..."
+    searchBox.PlaceholderColor3 = Color3.new(0.5, 0.5, 0.5)
+    searchBox.Text = ""
+    searchBox.TextColor3 = Color3.new(0.9, 0.9, 0.9)
+    searchBox.TextSize = 11
+    searchBox.Font = Enum.Font.SourceSans
+    searchBox.ZIndex = 12
+    searchBox.Parent = viewerControls
+    
     local scriptInfoLabel = Instance.new("TextLabel")
     scriptInfoLabel.Name = "ScriptInfoLabel"
-    scriptInfoLabel.Size = UDim2.new(1, -170, 1, 0)
-    scriptInfoLabel.Position = UDim2.new(0, 165, 0, 0)
+    scriptInfoLabel.Size = UDim2.new(1, -295, 1, 0)
+    scriptInfoLabel.Position = UDim2.new(0, 290, 0, 0)
     scriptInfoLabel.BackgroundTransparency = 1
     scriptInfoLabel.Text = "No script loaded"
     scriptInfoLabel.TextColor3 = Color3.new(0.7, 0.7, 0.7)
@@ -264,6 +984,7 @@ createScriptViewer = function()
     scriptInfoLabel.ZIndex = 12
     scriptInfoLabel.Parent = viewerControls
     
+    -- Original source frame
     local sourceFrame = Instance.new("ScrollingFrame")
     sourceFrame.Name = "SourceFrame"
     sourceFrame.Size = UDim2.new(1, -10, 1, -70)
@@ -289,6 +1010,7 @@ createScriptViewer = function()
     sourceText.TextXAlignment = Enum.TextXAlignment.Left
     sourceText.TextYAlignment = Enum.TextYAlignment.Top
     sourceText.TextWrapped = true
+    sourceText.RichText = false
     sourceText.ZIndex = 12
     sourceText.Parent = sourceFrame
     
@@ -320,49 +1042,168 @@ createScriptViewer = function()
     end)
 end
 
+-- Simple function - no syntax highlighting
+applySyntaxHighlighting = function(sourceText, code)
+    -- Just set plain text, no colors
+    sourceText.RichText = false
+    sourceText.Text = code or "No source code available"
+end
+
+generateLineNumbers = function(lineNumbersLabel, text)
+    local lines = {}
+    local lineCount = 1
+    
+    -- Count actual lines in the text (same method as help.lua)
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        table.insert(lines, tostring(lineCount))
+        lineCount = lineCount + 1
+    end
+    
+    if #lines == 0 then
+        lines = {"1"}
+    end
+    
+    lineNumbersLabel.Text = table.concat(lines, "\n")
+end
+
 showScriptInViewer = function(scriptName, scriptPath, source, scriptType)
     if not scriptViewer then
         createScriptViewer()
     end
     
+    -- Get UI elements from original structure
     local viewerElements = {
         titleText = scriptViewer:FindFirstChild("ViewerTitle"):FindFirstChild("ViewerTitleText"),
         infoLabel = scriptViewer:FindFirstChild("ViewerControls"):FindFirstChild("ScriptInfoLabel"),
         sourceText = scriptViewer:FindFirstChild("SourceFrame"):FindFirstChild("SourceText"),
         sourceFrame = scriptViewer:FindFirstChild("SourceFrame"),
         copyBtn = scriptViewer:FindFirstChild("ViewerControls"):FindFirstChild("CopySourceBtn"),
-        saveBtn = scriptViewer:FindFirstChild("ViewerControls"):FindFirstChild("SaveScriptBtn")
+        saveBtn = scriptViewer:FindFirstChild("ViewerControls"):FindFirstChild("SaveScriptBtn"),
+        searchBox = scriptViewer:FindFirstChild("ViewerControls"):FindFirstChild("SearchBox")
     }
     
+    -- Update title and info with character count
     viewerElements.titleText.Text = "Script Viewer - " .. scriptName
-    viewerElements.infoLabel.Text = scriptType .. " | " .. scriptPath
-    viewerElements.sourceText.Text = source or "Failed to decompile script"
     
-    local textBounds = game:GetService("TextService"):GetTextSize(
-        viewerElements.sourceText.Text,
-        viewerElements.sourceText.TextSize,
-        viewerElements.sourceText.Font,
-        Vector2.new(viewerElements.sourceFrame.AbsoluteSize.X - 10, math.huge)
+    local fileSize = source and #source or 0
+    local lineCount = source and #source:split("\n") or 0
+    viewerElements.infoLabel.Text = string.format("%s | %d chars", 
+        scriptType or "Unknown", 
+        fileSize
     )
     
-    viewerElements.sourceText.Size = UDim2.new(1, -10, 0, math.max(textBounds.Y, viewerElements.sourceFrame.AbsoluteSize.Y))
-    viewerElements.sourceFrame.CanvasSize = UDim2.new(0, 0, 0, textBounds.Y + 10)
+    -- Handle large scripts by truncating if necessary
+    local displaySource = source or "-- Failed to decompile script\n-- This could be due to:\n-- • Script protection/obfuscation\n-- • Executor limitations\n-- • Access restrictions"
     
+    local maxLength = 200000 -- Safe limit for Roblox TextLabel
+    local isTruncated = false
+    
+    if #displaySource > maxLength then
+        displaySource = displaySource:sub(1, maxLength) .. "\n\n-- [SCRIPT TRUNCATED - Too large to display fully]\n-- Original length: " .. #source .. " characters\n-- Showing first " .. maxLength .. " characters\n-- Use 'Copy Source' to get the complete script"
+        isTruncated = true
+    end
+    
+    -- Safely set the text
+    local success, err = pcall(function()
+        viewerElements.sourceText.Text = displaySource
+    end)
+    
+    if not success then
+        -- Fallback for extremely large scripts
+        viewerElements.sourceText.Text = "-- Script too large to display (" .. #(source or "") .. " characters)\n-- Use 'Copy Source' button to copy the full script\n-- Or 'Save Script' to save it to a file\n\n-- Preview (first 1000 characters):\n" .. (source and source:sub(1, 1000) or "No source available") .. "\n\n-- [TRUNCATED]"
+        displaySource = viewerElements.sourceText.Text
+        isTruncated = true
+    end
+    
+    -- Calculate text size and update canvas safely
+    local textBounds
+    local success, err = pcall(function()
+        textBounds = game:GetService("TextService"):GetTextSize(
+            displaySource:sub(1, 10000), -- Limit for size calculation
+            viewerElements.sourceText.TextSize,
+            viewerElements.sourceText.Font,
+            Vector2.new(math.max(viewerElements.sourceFrame.AbsoluteSize.X - 25, 100), math.huge)
+        )
+    end)
+    
+    if not success or not textBounds then
+        -- Fallback calculation based on line count
+        local lineCount = #displaySource:split("\n")
+        textBounds = {Y = lineCount * 16 + 50} -- Approximate height
+    end
+    
+    local calculatedHeight = math.max(textBounds.Y + 20, 300)
+    viewerElements.sourceText.Size = UDim2.new(1, -10, 0, calculatedHeight)
+    viewerElements.sourceFrame.CanvasSize = UDim2.new(0, 0, 0, calculatedHeight + 20)
+    
+    -- Button functionality
     viewerElements.copyBtn.MouseButton1Click:Connect(function()
-        copyToClipboard(source or "Failed to decompile script")
-        addLog("> Script source copied: " .. scriptName, Color3.new(0.5, 1, 0.5))
+        local sourceToClip = source or "Failed to decompile script"
+        
+        -- Handle large scripts
+        if #sourceToClip > 1000000 then -- 1MB limit for clipboard
+            addLog("> Script too large for clipboard (" .. #sourceToClip .. " chars). Use Save instead.", Color3.new(1, 0.8, 0.2))
+            return
+        end
+        
+        local success, err = pcall(function()
+            copyToClipboard(sourceToClip)
+        end)
+        
+        if success then
+            addLog("> Script source copied: " .. scriptName .. " (" .. #sourceToClip .. " chars)", Color3.new(0.5, 1, 0.5))
+        else
+            addLog("> Failed to copy script: " .. tostring(err), Color3.new(1, 0.5, 0.5))
+        end
     end)
     
     viewerElements.saveBtn.MouseButton1Click:Connect(function()
         if writefile then
+            local sourceToSave = source or "-- Failed to decompile script"
             local fileName = scriptName:gsub("[^%w%-%_]", "_") .. ".lua"
-            writefile(fileName, source or "Failed to decompile script")
-            addLog("> Script saved as: " .. fileName, Color3.new(0.5, 1, 0.5))
+            
+            local success, err = pcall(function()
+                writefile(fileName, sourceToSave)
+            end)
+            
+            if success then
+                addLog("> Script saved as: " .. fileName .. " (" .. #sourceToSave .. " chars)", Color3.new(0.5, 1, 0.5))
+            else
+                addLog("> Failed to save script: " .. tostring(err), Color3.new(1, 0.5, 0.5))
+            end
         else
             addLog("> writefile not supported by executor", Color3.new(1, 0.8, 0.2))
         end
     end)
     
+    -- Search functionality
+    viewerElements.searchBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed and viewerElements.searchBox.Text ~= "" then
+            local searchTerm = viewerElements.searchBox.Text:lower()
+            local sourceCode = viewerElements.sourceText.Text:lower()
+            
+            if sourceCode:find(searchTerm, 1, true) then -- plain text search
+                -- Find the position and scroll to it
+                local startPos = sourceCode:find(searchTerm, 1, true)
+                if startPos then
+                    -- Calculate approximate line number
+                    local beforeText = sourceCode:sub(1, startPos)
+                    local lineNumber = #beforeText:split("\n")
+                    
+                    -- Scroll to approximate position
+                    local scrollRatio = math.min(lineNumber / math.max(#sourceCode:split("\n"), 1), 1)
+                    viewerElements.sourceFrame.CanvasPosition = Vector2.new(0, 
+                        viewerElements.sourceFrame.CanvasSize.Y.Offset * scrollRatio)
+                    
+                    addLog("> Found '" .. viewerElements.searchBox.Text .. "' at line ~" .. lineNumber, Color3.new(0.5, 1, 0.5))
+                end
+            else
+                addLog("> '" .. viewerElements.searchBox.Text .. "' not found in script", Color3.new(1, 0.8, 0.2))
+            end
+        end
+    end)
+    
+    -- Show viewer normally
     scriptViewer.Visible = true
     scriptViewerVisible = true
 end
@@ -820,6 +1661,18 @@ createGUI = function()
     title.TextXAlignment = Enum.TextXAlignment.Left
     title.Parent = titleBar
     
+    local refreshBtn = Instance.new("ImageButton")
+    refreshBtn.Name = "RefreshButton"
+    refreshBtn.Size = UDim2.new(0, 20, 0, 20)
+    refreshBtn.Position = UDim2.new(1, -46, 0, 2)
+    refreshBtn.BackgroundColor3 = Color3.new(0.2, 0.2, 0.2)
+    refreshBtn.BorderColor3 = Color3.new(0.3, 0.3, 0.3)
+    refreshBtn.BorderSizePixel = 1
+    refreshBtn.Image = "rbxassetid://112631328410137"
+    refreshBtn.ImageColor3 = Color3.new(0.8, 0.8, 0.8)
+    refreshBtn.Parent = titleBar
+    makeButtonNonDraggable(refreshBtn)
+    
     local closeBtn = Instance.new("TextButton")
     closeBtn.Name = "CloseButton"
     closeBtn.Size = UDim2.new(0, 20, 0, 20)
@@ -910,6 +1763,29 @@ createGUI = function()
     decompilerHighlight.BorderSizePixel = 0
     decompilerHighlight.Visible = false
     decompilerHighlight.Parent = decompilerTab
+    
+    local gameTab = Instance.new("TextButton")
+    gameTab.Name = "GameTab"
+    gameTab.Size = UDim2.new(0, 70, 1, -3)
+    gameTab.Position = UDim2.new(0, 300, 0, 0)
+    gameTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+    gameTab.BorderColor3 = Color3.new(0.25, 0.25, 0.25)
+    gameTab.BorderSizePixel = 1
+    gameTab.Text = "Game"
+    gameTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+    gameTab.TextSize = 12
+    gameTab.Font = Enum.Font.SourceSans
+    gameTab.Parent = tabBar
+    makeButtonNonDraggable(gameTab)
+    
+    local gameHighlight = Instance.new("Frame")
+    gameHighlight.Name = "Highlight"
+    gameHighlight.Size = UDim2.new(1, 0, 0, 2)
+    gameHighlight.Position = UDim2.new(0, 0, 0, 0)
+    gameHighlight.BackgroundColor3 = Color3.new(1, 0.2, 0.2)
+    gameHighlight.BorderSizePixel = 0
+    gameHighlight.Visible = false
+    gameHighlight.Parent = gameTab
     
     local controlPanel = Instance.new("Frame")
     controlPanel.Name = "ControlPanel"
@@ -1331,6 +2207,13 @@ createGUI = function()
         end
     end)
     
+    refreshBtn.MouseButton1Click:Connect(function()
+        pcall(function()
+            _G.RemoteSpyClear()
+        end)
+        addLog("> Logs refreshed!", Color3.new(0.5, 1, 0.5))
+    end)
+    
     closeBtn.MouseButton1Click:Connect(function()
         _G.RemoteSpyClose()
     end)
@@ -1347,9 +2230,13 @@ createGUI = function()
             decompilerTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
             decompilerTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
             decompilerHighlight.Visible = false
+            gameTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            gameTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            gameHighlight.Visible = false
             logContainer.Visible = true
             httpLogContainer.Visible = false
             decompilerContainer.Visible = false
+            if gameFrame then gameFrame.Visible = false end
             controlPanel.Visible = true
         elseif tabName == "HttpSpy" then
             httpSpyTab.BackgroundColor3 = Color3.new(0.18, 0.18, 0.18)
@@ -1361,9 +2248,13 @@ createGUI = function()
             decompilerTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
             decompilerTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
             decompilerHighlight.Visible = false
+            gameTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            gameTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            gameHighlight.Visible = false
             logContainer.Visible = false
             httpLogContainer.Visible = true
             decompilerContainer.Visible = false
+            if gameFrame then gameFrame.Visible = false end
             controlPanel.Visible = false
         elseif tabName == "Decompiler" then
             decompilerTab.BackgroundColor3 = Color3.new(0.18, 0.18, 0.18)
@@ -1375,9 +2266,31 @@ createGUI = function()
             httpSpyTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
             httpSpyTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
             httpSpyHighlight.Visible = false
+            gameTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            gameTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            gameHighlight.Visible = false
             logContainer.Visible = false
             httpLogContainer.Visible = false
             decompilerContainer.Visible = true
+            if gameFrame then gameFrame.Visible = false end
+            controlPanel.Visible = false
+        elseif tabName == "Game" then
+            gameTab.BackgroundColor3 = Color3.new(0.18, 0.18, 0.18)
+            gameTab.TextColor3 = Color3.new(0.9, 0.9, 0.9)
+            gameHighlight.Visible = true
+            remoteSpyTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            remoteSpyTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            remoteSpyHighlight.Visible = false
+            httpSpyTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            httpSpyTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            httpSpyHighlight.Visible = false
+            decompilerTab.BackgroundColor3 = Color3.new(0.15, 0.15, 0.15)
+            decompilerTab.TextColor3 = Color3.new(0.7, 0.7, 0.7)
+            decompilerHighlight.Visible = false
+            logContainer.Visible = false
+            httpLogContainer.Visible = false
+            decompilerContainer.Visible = false
+            if gameFrame then gameFrame.Visible = true end
             controlPanel.Visible = false
         end
     end
@@ -1392,6 +2305,13 @@ createGUI = function()
     
     decompilerTab.MouseButton1Click:Connect(function()
         switchTab("Decompiler")
+    end)
+    
+    gameTab.MouseButton1Click:Connect(function()
+        if not gameFrame then
+            createGameFrame()
+        end
+        switchTab("Game")
     end)
     
     scanButton.MouseButton1Click:Connect(function()
@@ -1444,8 +2364,8 @@ local uiElements = {}
 createSettingsFrame = function()
     settingsFrame = Instance.new("Frame")
     settingsFrame.Name = "SettingsFrame"
-    settingsFrame.Size = UDim2.new(0, 280, 0, 300)
-    settingsFrame.Position = UDim2.new(0.5, -140, 0.5, -150)
+    settingsFrame.Size = UDim2.new(0, 280, 0, 430)
+    settingsFrame.Position = UDim2.new(0.5, -140, 0.5, -215)
     settingsFrame.BackgroundColor3 = Color3.new(0.1, 0.1, 0.1)
     settingsFrame.BorderColor3 = Color3.new(0.2, 0.2, 0.2)
     settingsFrame.BorderSizePixel = 1
@@ -1655,6 +2575,38 @@ createSettingsFrame = function()
         else
             maxLogsBox.Text = tostring(maxLogs)
         end
+    end)
+    
+    local antiCheatLabel = Instance.new("TextLabel")
+    antiCheatLabel.Size = UDim2.new(1, -20, 0, 20)
+    antiCheatLabel.Position = UDim2.new(0, 10, 0, 275)
+    antiCheatLabel.BackgroundTransparency = 1
+    antiCheatLabel.Text = "━━━━━━━━━ ANTI-CHEAT ━━━━━━━━━"
+    antiCheatLabel.TextColor3 = Color3.new(0.6, 0.6, 0.6)
+    antiCheatLabel.TextSize = 11
+    antiCheatLabel.Font = Enum.Font.SourceSans
+    antiCheatLabel.TextXAlignment = Enum.TextXAlignment.Center
+    antiCheatLabel.ZIndex = 12
+    antiCheatLabel.Parent = settingsFrame
+    
+    createToggle("Disable LocalScript Kicks", 300, disableLocalKicks, function(val)
+        toggleLocalKicks(val)
+        addLog("Disable LocalScript Kicks: " .. (val and "ON" or "OFF"), Color3.new(1, 1, 0))
+    end)
+    
+    createToggle("Disable Kick Remotes", 330, disableKickRemotes, function(val)
+        toggleKickRemotes(val)
+        addLog("Disable Kick Remotes: " .. (val and "ON" or "OFF"), Color3.new(1, 1, 0))
+    end)
+    
+    createToggle("Disable Anti-Cheat Scripts", 360, disableAntiCheatScripts, function(val)
+        toggleAntiCheatScripts(val)
+        addLog("Disable Anti-Cheat Scripts: " .. (val and "ON" or "OFF"), Color3.new(1, 1, 0))
+    end)
+    
+    createToggle("Disable LocalScript Teleports", 390, disableLocalTeleports, function(val)
+        toggleLocalTeleports(val)
+        addLog("Disable LocalScript Teleports: " .. (val and "ON" or "OFF"), Color3.new(1, 1, 0))
     end)
     
     closeSettings.MouseButton1Click:Connect(function()
